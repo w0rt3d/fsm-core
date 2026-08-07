@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [1.1.0]
 
 ### Добавлено: сериализация графа (`to_dict`/`from_dict`, `to_json`/`from_json`, `to_bson`/`from_bson`)
 

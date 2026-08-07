@@ -18,7 +18,7 @@ long_description = (ROOT / "README.md").read_text(encoding="utf-8")
 
 setup(
     name="fsm_core",
-    version="1.0",
+    version="1.1.0",
     description=(
         "In-memory DAG engine: typed nodes (pydantic), iterative graph "
         "algorithms, a priority event bus, and a plugin system with a "
