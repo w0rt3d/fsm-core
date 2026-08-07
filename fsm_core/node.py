@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from typing import Any, Dict, List, Literal, Optional, Set
+from typing import Any, ClassVar, Dict, List, Literal, Optional, Set, Type
 
 from pydantic import BaseModel, Field, PrivateAttr
 
@@ -66,6 +66,49 @@ class BaseNode(BaseModel):
     """
 
     model_config = {"arbitrary_types_allowed": True}
+
+    # Maps the discriminator value of the `type` field (e.g. "node",
+    # "pipeline", or whatever a custom subclass declares) to the class
+    # itself. Populated automatically -- see __init_subclass__ below --
+    # so that (de)serialization can rebuild the right class from a plain
+    # dict without the caller having to pass a type->class mapping by
+    # hand. BaseNode itself is registered explicitly right after the
+    # class body, since __init_subclass__ only fires for subclasses.
+    _type_registry: ClassVar[Dict[str, Type["BaseNode"]]] = {}
+
+    @classmethod
+    def __pydantic_init_subclass__(cls, **kwargs: Any) -> None:
+        # NOT the plain `__init_subclass__`: pydantic calls that before
+        # the subclass's own `model_fields` are finalized, so
+        # `cls.model_fields["type"].default` would still read the
+        # *parent's* default at that point (confirmed by hand -- it
+        # silently registered every subclass under "node"/"pipeline").
+        # `__pydantic_init_subclass__` is pydantic v2's hook for exactly
+        # this: it fires once the subclass's own fields are resolved.
+        super().__pydantic_init_subclass__(**kwargs)
+        type_field = cls.model_fields.get("type")
+        default = getattr(type_field, "default", None) if type_field else None
+        if isinstance(default, str):
+            existing = BaseNode._type_registry.get(default)
+            if existing is not None and existing is not cls:
+                logger.warning(
+                    "[NODE] type %r re-registered: %s -> %s (last one wins)",
+                    default, existing.__name__, cls.__name__,
+                )
+            BaseNode._type_registry[default] = cls
+
+    @classmethod
+    def register_type(cls, type_name: str, node_cls: Type["BaseNode"]) -> None:
+        """Manual escape hatch for classes that don't declare `type` as a
+        plain string default (e.g. build it dynamically)."""
+        BaseNode._type_registry[type_name] = node_cls
+
+    @classmethod
+    def class_for_type(cls, type_name: str) -> Type["BaseNode"]:
+        try:
+            return BaseNode._type_registry[type_name]
+        except KeyError as e:
+            raise InvalidOperationError(f"Unknown node type: {type_name!r}") from e
 
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     type: Literal["node"] = "node"
@@ -170,3 +213,7 @@ class BasePipeline(BaseNode):
 
     def __repr__(self) -> str:
         return f"BasePipeline(id={self.id!r}, tasks={len(self.children)})"
+
+
+BaseNode.register_type("node", BaseNode)
+BaseNode.register_type("pipeline", BasePipeline)

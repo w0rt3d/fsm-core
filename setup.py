@@ -33,6 +33,7 @@ setup(
     ],
     extras_require={
         "dev": ["pytest>=7.0"],
+        "bson": ["pymongo>=4.0"],
     },
     classifiers=[
         "Programming Language :: Python :: 3",

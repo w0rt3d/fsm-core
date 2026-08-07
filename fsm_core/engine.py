@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -7,7 +8,7 @@ from fsm_core._errors import wrap_errors
 from fsm_core.context import Context, ContextManager
 from fsm_core.dispatcher import EventDispatcher
 from fsm_core.event import EventBus
-from fsm_core.exceptions import GraphError, InvalidOperationError
+from fsm_core.exceptions import GraphError, InvalidOperationError, SerializationError
 from fsm_core.graph_utils import GraphUtils
 from fsm_core.node import BaseNode, BasePipeline
 from fsm_core.plugins import PluginRegistry
@@ -136,8 +137,31 @@ class GraphEngine:
     def get_node(self, node_id: str) -> Optional[BaseNode]:
         return self._nodes.get(node_id)
 
+    def get_all_nodes(self) -> List[BaseNode]:
+        """Every registered node, including ones not attached to the root
+        (e.g. built via ``create_node``/``create_pipeline`` but never
+        added anywhere). ``get_flat_list`` only sees what's reachable
+        from the root, so this exists as the complement -- primarily so
+        (de)serialization doesn't silently drop orphaned nodes."""
+        return list(self._nodes.values())
+
     def get_root(self) -> Optional[BasePipeline]:
         return self._root
+
+    @wrap_errors(InvalidOperationError)
+    def add_existing_node(self, node: BaseNode) -> "GraphEngine":
+        """Register a node object that was built elsewhere (typically by
+        a deserializer rebuilding a saved graph) instead of via
+        ``create_node``/``create_pipeline``. Mirrors the bookkeeping
+        those two already do -- registering in ``_nodes`` and claiming
+        the root slot for the first pipeline seen -- without emitting
+        creation events, since this isn't a creation, it's a restore."""
+        if not isinstance(node, BaseNode):
+            raise InvalidOperationError("node must be a BaseNode instance")
+        self._nodes[node.id] = node
+        if isinstance(node, BasePipeline) and self._root is None:
+            self._root = node
+        return self
 
     def get_flat_list(self) -> List[BaseNode]:
         return GraphUtils.get_flat_list(self._root) if self._root else []
@@ -317,6 +341,104 @@ class GraphEngine:
         logger.info("[ENGINE] Replaced %s with %s", old_node.id, new_node.id)
         self._event_bus.emit("graph_changed", data={"pipeline": self._root})
         return new_node
+
+    # -- serialization -------------------------------------------------
+    #
+    # Snapshot covers graph *structure* only: nodes (with whatever fields
+    # their concrete class declares) and the parent/child edges between
+    # them, plus which node is root. It deliberately does not cover
+    # engine config (max_history), the event bus's history, or plugin
+    # state -- those are runtime/process concerns, not graph data.
+    #
+    # `to_dict`/`from_dict` are the actual serialization; `to_json` /
+    # `from_json` and `to_bson` / `from_bson` are thin format adapters
+    # over that dict. JSON uses the stdlib (no extra dependency). BSON
+    # needs the `bson` package, so it's imported lazily, on first use --
+    # a project that never touches BSON shouldn't be forced to install
+    # it just because the engine *can* speak it.
+
+    @wrap_errors(SerializationError)
+    def to_dict(self) -> Dict[str, Any]:
+        nodes = []
+        for node in self._nodes.values():
+            data = node.model_dump(mode="json")
+            data["children"] = [c.id for c in node.children]
+            nodes.append(data)
+        return {"root_id": self._root.id if self._root else None, "nodes": nodes}
+
+    @classmethod
+    @wrap_errors(SerializationError, passthrough=(SerializationError,))
+    def from_dict(cls, data: Dict[str, Any], max_history: int = 1000) -> "GraphEngine":
+        engine = cls(max_history=max_history)
+        built: Dict[str, Tuple[BaseNode, List[str]]] = {}
+
+        for entry in data.get("nodes", []):
+            entry = dict(entry)
+            children_ids = entry.pop("children", [])
+            node_type = entry.get("type")
+            node_cls = BaseNode.class_for_type(node_type)
+            try:
+                node = node_cls(**entry)
+            except Exception as e:
+                raise SerializationError(
+                    f"Failed to build node {entry.get('id')!r} of type {node_type!r}: {e}"
+                ) from e
+            engine.add_existing_node(node)
+            built[node.id] = (node, children_ids)
+
+        # Second pass: wire edges through the normal add_node path, so
+        # cycle checks / dual parent+child bookkeeping stay the single
+        # source of truth instead of being re-implemented here.
+        for node, children_ids in built.values():
+            for child_id in children_ids:
+                if child_id not in built:
+                    raise SerializationError(f"Node {node.id!r} references unknown child {child_id!r}")
+                child_node, _ = built[child_id]
+                if child_node not in node.children:
+                    engine.add_node(node, child_node)
+
+        root_id = data.get("root_id")
+        if root_id is not None:
+            root_node = engine.get_node(root_id)
+            if root_node is None:
+                raise SerializationError(f"root_id {root_id!r} not found among deserialized nodes")
+            engine._root = root_node
+
+        return engine
+
+    @wrap_errors(SerializationError)
+    def to_json(self, **json_kwargs: Any) -> str:
+        return json.dumps(self.to_dict(), **json_kwargs)
+
+    @classmethod
+    @wrap_errors(SerializationError, passthrough=(SerializationError,))
+    def from_json(cls, raw: str, max_history: int = 1000) -> "GraphEngine":
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise SerializationError(f"Invalid JSON: {e}") from e
+        return cls.from_dict(data, max_history=max_history)
+
+    @wrap_errors(SerializationError, passthrough=(SerializationError,))
+    def to_bson(self) -> bytes:
+        try:
+            import bson
+        except ImportError as e:
+            raise SerializationError(
+                "BSON support requires the 'bson' package: pip install fsm_core[bson]"
+            ) from e
+        return bson.encode(self.to_dict())
+
+    @classmethod
+    @wrap_errors(SerializationError, passthrough=(SerializationError,))
+    def from_bson(cls, raw: bytes, max_history: int = 1000) -> "GraphEngine":
+        try:
+            import bson
+        except ImportError as e:
+            raise SerializationError(
+                "BSON support requires the 'bson' package: pip install fsm_core[bson]"
+            ) from e
+        return cls.from_dict(bson.decode(raw), max_history=max_history)
 
     def __repr__(self) -> str:
         return f"GraphEngine(nodes={len(self._nodes)}, root={self._root.id if self._root else None})"

@@ -22,6 +22,7 @@ __all__ = [
     "DuplicateNodeError",
     "CycleDetectedError",
     "PluginError",
+    "SerializationError",
 ]
 
 
@@ -81,3 +82,11 @@ class CycleDetectedError(GraphError):
 
 class PluginError(CoreError):
     pass
+
+
+# --- serialization -----------------------------------------------------
+
+class SerializationError(CoreError):
+    """Raised on both directions: malformed data being loaded (unknown
+    node type, dangling child reference) and data that cannot be encoded
+    in the requested format (e.g. BSON support not installed)."""
