@@ -1,0 +1,540 @@
+From a5e1c698e16bb84beb759a25d1141e257a0b6cea Mon Sep 17 00:00:00 2001
+From: fsm_core <you@example.com>
+Date: Fri, 7 Aug 2026 19:53:48 +0000
+Subject: [PATCH] Add graph serialization: to_dict/from_dict,
+ to_json/from_json, to_bson/from_bson
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- BaseNode: self-registering type registry (__pydantic_init_subclass__)
+  so custom node subclasses round-trip to the right class.
+- GraphEngine.get_all_nodes() / add_existing_node() — public accessors
+  needed to (de)serialize nodes not reachable from root.
+- GraphEngine.to_dict()/from_dict() — structural snapshot (nodes + edges
+  + root), edges rebuilt through the existing add_node() so cycle checks
+  aren't duplicated.
+- to_json()/from_json() via stdlib json (no new dependency).
+- to_bson()/from_bson() via lazily-imported bson; raises SerializationError
+  with an install hint if the optional 'bson' extra isn't installed.
+- New SerializationError(CoreError) exception.
+- setup.py: extras_require['bson'] = ['pymongo>=4.0'].
+- tests/test_serialization.py: round trip, custom subclass, orphan nodes,
+  invalid JSON, dangling child ref, unknown type, missing-bson error,
+  real bson round trip.
+---
+ CHANGELOG.md                |  43 ++++++++++
+ fsm_core/__init__.py        |   2 +
+ fsm_core/engine.py          | 124 +++++++++++++++++++++++++++-
+ fsm_core/exceptions.py      |   9 +++
+ fsm_core/node.py            |  51 +++++++++++-
+ setup.py                    |   1 +
+ tests/test_serialization.py | 157 ++++++++++++++++++++++++++++++++++++
+ 7 files changed, 384 insertions(+), 3 deletions(-)
+ create mode 100644 tests/test_serialization.py
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f4b494e..7609191 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,5 +1,48 @@
+ # Changelog
+ 
++## [Unreleased]
++
++### Добавлено: сериализация графа (`to_dict`/`from_dict`, `to_json`/`from_json`, `to_bson`/`from_bson`)
++
++`GraphEngine` умеет сохранять и восстанавливать структуру графа (узлы + рёбра
+++ корень). Формат снапшота — структура, а не рантайм-состояние: `max_history`
++движка, история event bus'а и состояние плагинов в снапшот не входят.
++
++- `BaseNode` получил саморегистрирующийся реестр типов
++  (`BaseNode._type_registry`, `class_for_type`, `register_type`). Любой
++  подкласс, объявляющий `type: Literal["..."] = "..."`, регистрируется
++  автоматически в момент объявления класса — десериализатору не нужно
++  передавать `type -> class` маппинг руками. Регистрация повешена на
++  `__pydantic_init_subclass__`, а не на обычный `__init_subclass__`: на
++  последнем `model_fields` подкласса ещё не пересчитаны, и `type.default`
++  в этот момент возвращает значение *родителя*, а не подкласса — этим
++  ловится за счёт того, что `__pydantic_init_subclass__` в pydantic v2
++  вызывается уже после сборки полей.
++- `GraphEngine.get_all_nodes()` — все зарегистрированные ноды, включая не
++  подвешенные к root (`get_flat_list()` видит только достижимое от root).
++- `GraphEngine.add_existing_node(node)` — регистрирует уже собранный объект
++  ноды (как это делают `create_node`/`create_pipeline` внутри себя), не
++  создавая новый и не эмитя события создания — это не создание, а восстановление.
++- `GraphEngine.to_dict()` / `GraphEngine.from_dict(data)` — базовый формат:
++  список нод (`node.model_dump(mode="json")` + список id детей) и `root_id`.
++  Рёбра при восстановлении проводятся через штатный `add_node`, чтобы проверка
++  циклов и двусторонний parent/child учёт не дублировались отдельной веткой
++  кода.
++- `GraphEngine.to_json()` / `GraphEngine.from_json(raw)` — обёртка над
++  `to_dict`/`from_dict` через `json` из стандартной библиотеки, без новых
++  зависимостей.
++- `GraphEngine.to_bson()` / `GraphEngine.from_bson(raw)` — то же самое через
++  `bson`, но с ленивым `import bson` внутри метода: пакет не входит в
++  обязательные зависимости (`install_requires`), а добавлен как opt-in extra
++  `pip install fsm_core[bson]` в `setup.py`. Без пакета `to_bson`/`from_bson`
++  кидают `SerializationError` с понятным текстом вместо `ImportError` из
++  глубины стека.
++- Новое исключение `SerializationError(CoreError)` — на обе стороны:
++  и на невалидные данные при загрузке (неизвестный тип ноды, ссылка на
++  несуществующего ребёнка), и на невозможность закодировать в нужный формат.
++  Тесты: `tests/test_serialization.py`.
++
++
+ В коде пакета нет атрибута `__version__` и нет тегов/истории git, по
+ которым можно восстановить хронологию релизов. Поэтому этот файл — не
+ классический per-release changelog с датами, а перечень фиксов,
+diff --git a/fsm_core/__init__.py b/fsm_core/__init__.py
+index 50f6b28..89f9cc3 100644
+--- a/fsm_core/__init__.py
++++ b/fsm_core/__init__.py
+@@ -1,6 +1,7 @@
+ from fsm_core.context import Context, ContextManager
+ from fsm_core.engine import GraphEngine
+ from fsm_core.event import Event, EventBus, EventHandler, EventPriority
++from fsm_core.exceptions import SerializationError
+ from fsm_core.graph_utils import GraphUtils
+ from fsm_core.node import BaseNode, BasePipeline
+ from fsm_core.plugins import BasePlugin, PluginHealth, PluginRegistry
+@@ -19,4 +20,5 @@ __all__ = [
+     "Context",
+     "ContextManager",
+     "GraphUtils",
++    "SerializationError",
+ ]
+diff --git a/fsm_core/engine.py b/fsm_core/engine.py
+index cc5f29e..3ea6795 100644
+--- a/fsm_core/engine.py
++++ b/fsm_core/engine.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import json
+ import logging
+ from typing import Any, Dict, List, Optional, Tuple
+ 
+@@ -7,7 +8,7 @@ from fsm_core._errors import wrap_errors
+ from fsm_core.context import Context, ContextManager
+ from fsm_core.dispatcher import EventDispatcher
+ from fsm_core.event import EventBus
+-from fsm_core.exceptions import GraphError, InvalidOperationError
++from fsm_core.exceptions import GraphError, InvalidOperationError, SerializationError
+ from fsm_core.graph_utils import GraphUtils
+ from fsm_core.node import BaseNode, BasePipeline
+ from fsm_core.plugins import PluginRegistry
+@@ -136,9 +137,32 @@ class GraphEngine:
+     def get_node(self, node_id: str) -> Optional[BaseNode]:
+         return self._nodes.get(node_id)
+ 
++    def get_all_nodes(self) -> List[BaseNode]:
++        """Every registered node, including ones not attached to the root
++        (e.g. built via ``create_node``/``create_pipeline`` but never
++        added anywhere). ``get_flat_list`` only sees what's reachable
++        from the root, so this exists as the complement -- primarily so
++        (de)serialization doesn't silently drop orphaned nodes."""
++        return list(self._nodes.values())
++
+     def get_root(self) -> Optional[BasePipeline]:
+         return self._root
+ 
++    @wrap_errors(InvalidOperationError)
++    def add_existing_node(self, node: BaseNode) -> "GraphEngine":
++        """Register a node object that was built elsewhere (typically by
++        a deserializer rebuilding a saved graph) instead of via
++        ``create_node``/``create_pipeline``. Mirrors the bookkeeping
++        those two already do -- registering in ``_nodes`` and claiming
++        the root slot for the first pipeline seen -- without emitting
++        creation events, since this isn't a creation, it's a restore."""
++        if not isinstance(node, BaseNode):
++            raise InvalidOperationError("node must be a BaseNode instance")
++        self._nodes[node.id] = node
++        if isinstance(node, BasePipeline) and self._root is None:
++            self._root = node
++        return self
++
+     def get_flat_list(self) -> List[BaseNode]:
+         return GraphUtils.get_flat_list(self._root) if self._root else []
+ 
+@@ -318,5 +342,103 @@ class GraphEngine:
+         self._event_bus.emit("graph_changed", data={"pipeline": self._root})
+         return new_node
+ 
++    # -- serialization -------------------------------------------------
++    #
++    # Snapshot covers graph *structure* only: nodes (with whatever fields
++    # their concrete class declares) and the parent/child edges between
++    # them, plus which node is root. It deliberately does not cover
++    # engine config (max_history), the event bus's history, or plugin
++    # state -- those are runtime/process concerns, not graph data.
++    #
++    # `to_dict`/`from_dict` are the actual serialization; `to_json` /
++    # `from_json` and `to_bson` / `from_bson` are thin format adapters
++    # over that dict. JSON uses the stdlib (no extra dependency). BSON
++    # needs the `bson` package, so it's imported lazily, on first use --
++    # a project that never touches BSON shouldn't be forced to install
++    # it just because the engine *can* speak it.
++
++    @wrap_errors(SerializationError)
++    def to_dict(self) -> Dict[str, Any]:
++        nodes = []
++        for node in self._nodes.values():
++            data = node.model_dump(mode="json")
++            data["children"] = [c.id for c in node.children]
++            nodes.append(data)
++        return {"root_id": self._root.id if self._root else None, "nodes": nodes}
++
++    @classmethod
++    @wrap_errors(SerializationError, passthrough=(SerializationError,))
++    def from_dict(cls, data: Dict[str, Any], max_history: int = 1000) -> "GraphEngine":
++        engine = cls(max_history=max_history)
++        built: Dict[str, Tuple[BaseNode, List[str]]] = {}
++
++        for entry in data.get("nodes", []):
++            entry = dict(entry)
++            children_ids = entry.pop("children", [])
++            node_type = entry.get("type")
++            node_cls = BaseNode.class_for_type(node_type)
++            try:
++                node = node_cls(**entry)
++            except Exception as e:
++                raise SerializationError(
++                    f"Failed to build node {entry.get('id')!r} of type {node_type!r}: {e}"
++                ) from e
++            engine.add_existing_node(node)
++            built[node.id] = (node, children_ids)
++
++        # Second pass: wire edges through the normal add_node path, so
++        # cycle checks / dual parent+child bookkeeping stay the single
++        # source of truth instead of being re-implemented here.
++        for node, children_ids in built.values():
++            for child_id in children_ids:
++                if child_id not in built:
++                    raise SerializationError(f"Node {node.id!r} references unknown child {child_id!r}")
++                child_node, _ = built[child_id]
++                if child_node not in node.children:
++                    engine.add_node(node, child_node)
++
++        root_id = data.get("root_id")
++        if root_id is not None:
++            root_node = engine.get_node(root_id)
++            if root_node is None:
++                raise SerializationError(f"root_id {root_id!r} not found among deserialized nodes")
++            engine._root = root_node
++
++        return engine
++
++    @wrap_errors(SerializationError)
++    def to_json(self, **json_kwargs: Any) -> str:
++        return json.dumps(self.to_dict(), **json_kwargs)
++
++    @classmethod
++    @wrap_errors(SerializationError, passthrough=(SerializationError,))
++    def from_json(cls, raw: str, max_history: int = 1000) -> "GraphEngine":
++        try:
++            data = json.loads(raw)
++        except json.JSONDecodeError as e:
++            raise SerializationError(f"Invalid JSON: {e}") from e
++        return cls.from_dict(data, max_history=max_history)
++
++    @wrap_errors(SerializationError, passthrough=(SerializationError,))
++    def to_bson(self) -> bytes:
++        try:
++            import bson
++        except ImportError as e:
++            raise SerializationError(
++                "BSON support requires the 'bson' package: pip install fsm_core[bson]"
++            ) from e
++        return bson.encode(self.to_dict())
++
++    @classmethod
++    @wrap_errors(SerializationError, passthrough=(SerializationError,))
++    def from_bson(cls, raw: bytes, max_history: int = 1000) -> "GraphEngine":
++        try:
++            import bson
++        except ImportError as e:
++            raise SerializationError(
++                "BSON support requires the 'bson' package: pip install fsm_core[bson]"
++            ) from e
++        return cls.from_dict(bson.decode(raw), max_history=max_history)
++
+     def __repr__(self) -> str:
+         return f"GraphEngine(nodes={len(self._nodes)}, root={self._root.id if self._root else None})"
+diff --git a/fsm_core/exceptions.py b/fsm_core/exceptions.py
+index 28d5d8f..6f1178e 100644
+--- a/fsm_core/exceptions.py
++++ b/fsm_core/exceptions.py
+@@ -22,6 +22,7 @@ __all__ = [
+     "DuplicateNodeError",
+     "CycleDetectedError",
+     "PluginError",
++    "SerializationError",
+ ]
+ 
+ 
+@@ -81,3 +82,11 @@ class CycleDetectedError(GraphError):
+ 
+ class PluginError(CoreError):
+     pass
++
++
++# --- serialization -----------------------------------------------------
++
++class SerializationError(CoreError):
++    """Raised on both directions: malformed data being loaded (unknown
++    node type, dangling child reference) and data that cannot be encoded
++    in the requested format (e.g. BSON support not installed)."""
+diff --git a/fsm_core/node.py b/fsm_core/node.py
+index 67dbe8e..9c29d89 100644
+--- a/fsm_core/node.py
++++ b/fsm_core/node.py
+@@ -2,7 +2,7 @@ from __future__ import annotations
+ 
+ import logging
+ import uuid
+-from typing import Any, Dict, List, Literal, Optional, Set
++from typing import Any, ClassVar, Dict, List, Literal, Optional, Set, Type
+ 
+ from pydantic import BaseModel, Field, PrivateAttr
+ 
+@@ -67,6 +67,49 @@ class BaseNode(BaseModel):
+ 
+     model_config = {"arbitrary_types_allowed": True}
+ 
++    # Maps the discriminator value of the `type` field (e.g. "node",
++    # "pipeline", or whatever a custom subclass declares) to the class
++    # itself. Populated automatically -- see __init_subclass__ below --
++    # so that (de)serialization can rebuild the right class from a plain
++    # dict without the caller having to pass a type->class mapping by
++    # hand. BaseNode itself is registered explicitly right after the
++    # class body, since __init_subclass__ only fires for subclasses.
++    _type_registry: ClassVar[Dict[str, Type["BaseNode"]]] = {}
++
++    @classmethod
++    def __pydantic_init_subclass__(cls, **kwargs: Any) -> None:
++        # NOT the plain `__init_subclass__`: pydantic calls that before
++        # the subclass's own `model_fields` are finalized, so
++        # `cls.model_fields["type"].default` would still read the
++        # *parent's* default at that point (confirmed by hand -- it
++        # silently registered every subclass under "node"/"pipeline").
++        # `__pydantic_init_subclass__` is pydantic v2's hook for exactly
++        # this: it fires once the subclass's own fields are resolved.
++        super().__pydantic_init_subclass__(**kwargs)
++        type_field = cls.model_fields.get("type")
++        default = getattr(type_field, "default", None) if type_field else None
++        if isinstance(default, str):
++            existing = BaseNode._type_registry.get(default)
++            if existing is not None and existing is not cls:
++                logger.warning(
++                    "[NODE] type %r re-registered: %s -> %s (last one wins)",
++                    default, existing.__name__, cls.__name__,
++                )
++            BaseNode._type_registry[default] = cls
++
++    @classmethod
++    def register_type(cls, type_name: str, node_cls: Type["BaseNode"]) -> None:
++        """Manual escape hatch for classes that don't declare `type` as a
++        plain string default (e.g. build it dynamically)."""
++        BaseNode._type_registry[type_name] = node_cls
++
++    @classmethod
++    def class_for_type(cls, type_name: str) -> Type["BaseNode"]:
++        try:
++            return BaseNode._type_registry[type_name]
++        except KeyError as e:
++            raise InvalidOperationError(f"Unknown node type: {type_name!r}") from e
++
+     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+     type: Literal["node"] = "node"
+     parents: List[BaseNode] = Field(default_factory=list, exclude=True)
+@@ -169,4 +212,8 @@ class BasePipeline(BaseNode):
+         return self.children
+ 
+     def __repr__(self) -> str:
+-        return f"BasePipeline(id={self.id!r}, tasks={len(self.children)})"
+\ No newline at end of file
++        return f"BasePipeline(id={self.id!r}, tasks={len(self.children)})"
++
++
++BaseNode.register_type("node", BaseNode)
++BaseNode.register_type("pipeline", BasePipeline)
+\ No newline at end of file
+diff --git a/setup.py b/setup.py
+index 719e871..29a6f62 100644
+--- a/setup.py
++++ b/setup.py
+@@ -33,6 +33,7 @@ setup(
+     ],
+     extras_require={
+         "dev": ["pytest>=7.0"],
++        "bson": ["pymongo>=4.0"],
+     },
+     classifiers=[
+         "Programming Language :: Python :: 3",
+diff --git a/tests/test_serialization.py b/tests/test_serialization.py
+new file mode 100644
+index 0000000..9446099
+--- /dev/null
++++ b/tests/test_serialization.py
+@@ -0,0 +1,157 @@
++"""
++Tests for GraphEngine (de)serialization: to_dict/from_dict, to_json/from_json,
++to_bson/from_bson, and the BaseNode type registry that makes custom node
++subclasses round-trip correctly.
++
++Run with: pytest tests/test_serialization.py -v
++"""
++from typing import Literal
++
++import pytest
++
++from fsm_core.engine import GraphEngine
++from fsm_core.exceptions import SerializationError
++from fsm_core.node import BaseNode, BasePipeline
++
++
++class TaskNode(BaseNode):
++    """A custom node subclass with its own field, used to check that
++    (de)serialization preserves subclass-specific data and picks the
++    right class back up via the type registry."""
++
++    type: Literal["task"] = "task"
++    status: str = "pending"
++
++
++def _build_sample_engine() -> GraphEngine:
++    e = GraphEngine()
++    root = e.create_pipeline("root")
++    a = TaskNode(id="a", status="done")
++    e.add_existing_node(a)
++    e.add_node(root, a)
++    b = e.create_node("b")
++    e.add_node(root, b)
++    # diamond: c has two parents (a and b)
++    c = TaskNode(id="c", status="pending")
++    e.add_existing_node(c)
++    e.add_node(a, c)
++    e.add_node(b, c)
++    return e
++
++
++def test_to_dict_round_trip_preserves_structure_and_root():
++    e = _build_sample_engine()
++    data = e.to_dict()
++
++    e2 = GraphEngine.from_dict(data)
++
++    assert e2.get_root().id == "root"
++    ids = {n.id for n in e2.get_all_nodes()}
++    assert ids == {"root", "a", "b", "c"}
++
++    root2 = e2.get_root()
++    child_ids = {c.id for c in root2.children}
++    assert child_ids == {"a", "b"}
++
++    c2 = e2.get_node("c")
++    assert {p.id for p in c2.parents} == {"a", "b"}
++
++
++def test_custom_subclass_fields_and_type_survive_round_trip():
++    e = _build_sample_engine()
++    data = e.to_dict()
++    e2 = GraphEngine.from_dict(data)
++
++    a2 = e2.get_node("a")
++    assert isinstance(a2, TaskNode)
++    assert a2.status == "done"
++
++    c2 = e2.get_node("c")
++    assert isinstance(c2, TaskNode)
++    assert c2.status == "pending"
++
++    # plain node stayed a plain node/pipeline, not a TaskNode
++    b2 = e2.get_node("b")
++    assert type(b2) is BaseNode
++    root2 = e2.get_root()
++    assert type(root2) is BasePipeline
++
++
++def test_get_all_nodes_includes_orphans_not_reachable_from_root():
++    e = GraphEngine()
++    e.create_pipeline("root")
++    e.create_node("orphan")  # never attached anywhere
++
++    all_ids = {n.id for n in e.get_all_nodes()}
++    assert "orphan" in all_ids
++    # get_flat_list, by contrast, only sees what's reachable from root
++    assert "orphan" not in {n.id for n in e.get_flat_list()}
++
++    # and the orphan survives a round trip too
++    e2 = GraphEngine.from_dict(e.to_dict())
++    assert "orphan" in {n.id for n in e2.get_all_nodes()}
++
++
++def test_json_round_trip():
++    e = _build_sample_engine()
++    raw = e.to_json()
++    assert isinstance(raw, str)
++
++    e2 = GraphEngine.from_json(raw)
++    assert e2.get_root().id == "root"
++    assert {n.id for n in e2.get_all_nodes()} == {"root", "a", "b", "c"}
++
++
++def test_from_json_rejects_invalid_json():
++    with pytest.raises(SerializationError):
++        GraphEngine.from_json("{not valid json")
++
++
++def test_from_dict_rejects_dangling_child_reference():
++    data = {
++        "root_id": "root",
++        "nodes": [
++            {"id": "root", "type": "pipeline", "extensions": {}, "metadata": {}, "children": ["ghost"]},
++        ],
++    }
++    with pytest.raises(SerializationError):
++        GraphEngine.from_dict(data)
++
++
++def test_from_dict_rejects_unknown_node_type():
++    data = {
++        "root_id": "root",
++        "nodes": [
++            {"id": "root", "type": "does_not_exist", "extensions": {}, "metadata": {}, "children": []},
++        ],
++    }
++    with pytest.raises(SerializationError):
++        GraphEngine.from_dict(data)
++
++
++def test_to_bson_without_bson_installed_raises_clear_error(monkeypatch):
++    import builtins
++
++    real_import = builtins.__import__
++
++    def fake_import(name, *args, **kwargs):
++        if name == "bson":
++            raise ImportError("simulated: bson not installed")
++        return real_import(name, *args, **kwargs)
++
++    monkeypatch.setattr(builtins, "__import__", fake_import)
++
++    e = _build_sample_engine()
++    with pytest.raises(SerializationError, match="bson"):
++        e.to_bson()
++
++
++def test_bson_round_trip_if_available():
++    bson = pytest.importorskip("bson")
++    e = _build_sample_engine()
++    raw = e.to_bson()
++    assert isinstance(raw, bytes)
++
++    e2 = GraphEngine.from_bson(raw)
++    assert e2.get_root().id == "root"
++    assert {n.id for n in e2.get_all_nodes()} == {"root", "a", "b", "c"}
+-- 
+2.43.0
+
